@@ -16,7 +16,7 @@ export const VideoPlayer = memo(
   forwardRef<HTMLVideoElement, VideoPlayerProps>(
     ({ videoSrc, audioSrc }, ref) => {
       const videoRef = useRef<HTMLVideoElement>(null);
-      const audioRef = useRef<HTMLAudioElement>(null);
+      const audioRef = useRef<HTMLVideoElement>(null);
       const videoHlsInstance = useRef<Hls | null>(null);
       const audioHlsInstance = useRef<Hls | null>(null);
 
@@ -58,7 +58,7 @@ export const VideoPlayer = memo(
 
         const playListener = async () => {
           if (audio.paused) {
-            await audio.play();
+            await Promise.all([video.play(), audio.play()]);
           }
         };
 
@@ -81,11 +81,18 @@ export const VideoPlayer = memo(
           audio.currentTime = 0;
         };
 
+        const syncListener = () => {
+          if (Math.abs(video.currentTime - audio.currentTime) > 0.1) {
+            audio.currentTime = video.currentTime;
+          }
+        };
+
         video.addEventListener("play", playListener);
         video.addEventListener("pause", pauseListener);
         video.addEventListener("seeked", seekListener);
         video.addEventListener("volumechange", volumeChangeListener);
         video.addEventListener("ended", endedListener);
+        video.addEventListener("timeupdate", syncListener);
 
         return () => {
           video.removeEventListener("play", playListener);
@@ -93,6 +100,7 @@ export const VideoPlayer = memo(
           video.removeEventListener("seeked", seekListener);
           video.removeEventListener("volumechange", volumeChangeListener);
           video.removeEventListener("ended", endedListener);
+          video.removeEventListener("timeupdate", syncListener);
         };
       }, [audioSrc]);
 
@@ -107,7 +115,7 @@ export const VideoPlayer = memo(
             controls={false}
           />
           {audioSrc && (
-            <audio
+            <video
               muted={false}
               ref={audioRef}
               style={{ display: "none" }}

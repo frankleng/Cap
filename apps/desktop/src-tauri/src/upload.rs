@@ -26,6 +26,8 @@ pub async fn upload_file(
 
         let file_key = format!("{}/{}/{}/{}", options.user_id, options.video_id, file_type, file_name);
 
+        println!("--------File key: {}", file_key);
+
         let server_url_base: &'static str = dotenv_codegen::dotenv!("NEXT_PUBLIC_URL");
         let server_url = format!("{}/api/upload/signed", server_url_base);
 
@@ -141,7 +143,7 @@ async fn get_video_duration(file_path: &str) -> Result<f64, String> {
     // Extract the duration from FFmpeg's stderr
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    println!("Stderr: {}", stderr);
+    println!("Video duration stderr: {}", stderr);
 
     let duration_line = stderr.split('\n')
         .find(|line| line.contains("Duration"))

@@ -180,7 +180,6 @@ fn main() {
                 recording_options: None,
                 shutdown_flag: Arc::new(AtomicBool::new(false)),
                 video_uploading_finished: Arc::new(AtomicBool::new(false)),
-                audio_uploading_finished: Arc::new(AtomicBool::new(false)),
                 data_dir: Some(data_directory),
                 max_screen_width: max_width as usize,
                 max_screen_height: max_height as usize,

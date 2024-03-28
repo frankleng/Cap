@@ -6,6 +6,7 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::io::{ErrorKind::WouldBlock, Error};
 use std::time::{Instant, Duration};
 use std::path::Path;
+use std::sync::mpsc::{channel, Sender, Receiver};
 use image::{ImageBuffer, Rgba, ImageFormat};
 use image::codecs::jpeg::JpegEncoder;
 
@@ -54,7 +55,7 @@ impl MediaRecorder {
         }
     }
 
-    pub async fn start_media_recording(&mut self, options: RecordingOptions, audio_file_path: &str, video_file_path: &str, screenshot_file_path: &str, custom_device: Option<&str>, max_screen_width: usize, max_screen_height: usize) -> Result<(), String> {
+    pub async fn start_media_recording(&mut self, options: RecordingOptions, audio_file_path: &str, video_file_path: &str, muxed_file_path: &str, screenshot_file_path: &str, custom_device: Option<&str>, max_screen_width: usize, max_screen_height: usize) -> Result<(), String> {
         self.options = Some(options.clone());
 
         println!("Custom device: {:?}", custom_device);
@@ -144,6 +145,7 @@ impl MediaRecorder {
         
         let audio_file_path_owned = audio_file_path.to_owned();
         let video_file_path_owned = video_file_path.to_owned();
+        let muxed_file_path_owned = muxed_file_path.to_owned();
         let sample_rate_str = sample_rate.to_string();
         let channels_str = channels.to_string();
         
@@ -404,7 +406,7 @@ impl MediaRecorder {
         println!("Starting audio recording and processing...");
         let audio_output_chunk_pattern = format!("{}/audio_recording_%03d.aac", audio_file_path_owned);
         let audio_segment_list_filename = format!("{}/segment_list.txt", audio_file_path_owned);
-        let video_output_chunk_pattern = format!("{}/video_recording_%03d.ts", video_file_path_owned);
+        let video_output_chunk_pattern = format!("{}/video_recording_%03d.mp4", video_file_path_owned);
         let video_segment_list_filename = format!("{}/segment_list.txt", video_file_path_owned);
       
         let mut audio_filters = Vec::new();
@@ -439,16 +441,15 @@ impl MediaRecorder {
             "-r", "30",
             "-thread_queue_size", "4096",
             "-i", "pipe:0",
-            "-vf", "fps=30,scale=in_range=full:out_range=limited,eq=saturation=1.15",
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
             "-pix_fmt", "yuv420p",
+            "-preset", "ultrafast",
             "-tune", "zerolatency",
             "-vsync", "1",
+            "-force_key_frames", "expr:gte(t,n_forced*3)",
             "-f", "segment",
             "-segment_time", "3",
             "-segment_list", &video_segment_list_filename,
-            "-segment_format", "mpegts",
+            "-segment_format", "mp4",
             "-reset_timestamps", "1",
             &video_output_chunk_pattern,
         ].into_iter().map(|s| s.to_string()).collect();
@@ -516,6 +517,65 @@ impl MediaRecorder {
                         stdin.write_all(&bytes).await.expect("Failed to write video data to FFmpeg stdin");
                     }
                     drop(video_stdin_guard);
+                }
+            }
+        });
+
+        let audio_file_path_owned = audio_file_path_owned.clone();
+        let video_file_path_owned = video_file_path_owned.clone();
+        let muxed_file_path_owned = muxed_file_path_owned.clone();
+        let ffmpeg_binary_path_str = ffmpeg_binary_path_str.to_owned();
+        let should_stop = Arc::clone(&self.should_stop);
+
+        let (tx, rx): (Sender<(String, String, String)>, Receiver<(String, String, String)>) = channel();
+
+        tokio::spawn(async move {
+            while let Ok((video_segment_path, audio_segment_path, output_segment_path)) = rx.recv() {
+                if let Err(e) = mux_segments(&ffmpeg_binary_path_str, &video_segment_path, &audio_segment_path, &output_segment_path).await {
+                    eprintln!("Failed to mux segments: {}", e);
+                } else {
+                    println!("Muxed segments saved as: {}", output_segment_path);
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut audio_segment_index = 0;
+            let mut video_segment_index = 0;
+
+            println!("Starting muxing loop...");
+
+            loop {
+                let audio_segment_list_path = format!("{}/segment_list.txt", audio_file_path_owned);
+                let video_segment_list_path = format!("{}/segment_list.txt", video_file_path_owned);
+
+                if std::path::Path::new(&audio_segment_list_path).exists() && std::path::Path::new(&video_segment_list_path).exists() {
+                    println!("Found audio and video segment lists");
+                    let audio_segments = std::fs::read_to_string(&audio_segment_list_path).expect("Failed to read audio segment list");
+                    let video_segments = std::fs::read_to_string(&video_segment_list_path).expect("Failed to read video segment list");
+
+                    let audio_segments: Vec<&str> = audio_segments.lines().collect();
+                    let video_segments: Vec<&str> = video_segments.lines().collect();
+
+                    while audio_segment_index < audio_segments.len() && video_segment_index < video_segments.len() {
+                        println!("Muxing segments: {} and {}", audio_segment_index, video_segment_index);
+
+                        let audio_segment_path = format!("{}/{}", audio_file_path_owned, audio_segments[audio_segment_index]);
+                        let video_segment_path = format!("{}/{}", video_file_path_owned, video_segments[video_segment_index]);
+                        let output_segment_path = format!("{}/muxed_segment_{:03}.ts", muxed_file_path_owned, video_segment_index);
+
+                        // Send the paths to the muxing thread
+                        tx.send((video_segment_path, audio_segment_path, output_segment_path)).unwrap();
+
+                        audio_segment_index += 1;
+                        video_segment_index += 1;
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                if should_stop.load(Ordering::SeqCst) {
+                    break;
                 }
             }
         });
@@ -728,4 +788,52 @@ async fn adjust_ffmpeg_commands_based_on_start_times(
         println!("Applying -itsoffset {:.3} to audio", offset_seconds);
     }
 
+}
+
+async fn mux_segments(ffmpeg_binary_path_str: &str, video_segment_path: &str, audio_segment_path: &str, output_segment_path: &str) -> Result<(), std::io::Error> {
+    let args = vec![
+        "-i".to_string(), video_segment_path.to_string(),
+        "-i".to_string(), audio_segment_path.to_string(),
+        "-c:v".to_string(), "libx264".to_string(),
+        "-preset".to_string(), "veryfast".to_string(),
+        "-c:a".to_string(), "aac".to_string(),
+        "-b:a".to_string(), "128k".to_string(),
+        "-f".to_string(), "mpegts".to_string(),
+        "-y".to_string(),
+        output_segment_path.to_string(),
+    ];
+
+    let mut process = Command::new(ffmpeg_binary_path_str)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(process_stderr) = process.stderr.take() {
+        tokio::spawn(async move {
+            let mut process_reader = BufReader::new(process_stderr).lines();
+            while let Ok(Some(line)) = process_reader.next_line().await {
+                eprintln!("FFmpeg muxing STDERR: {}", line);
+            }
+        });
+    }
+
+    let status = process.wait().await?;
+    if !status.success() {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "FFmpeg muxing process failed"));
+    }
+
+    let output_dir = Path::new(output_segment_path).parent().unwrap().to_str().unwrap();
+    let segment_list_path = format!("{}/segment_list.txt", output_dir);
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .append(true)
+        .open(segment_list_path)
+        .await?;
+
+    let output_filename = Path::new(output_segment_path).file_name().unwrap().to_str().unwrap();
+    file.write_all(format!("{}\n", output_filename).as_bytes()).await?;
+
+    Ok(())
 }

@@ -87,6 +87,16 @@ export const MediaDeviceProvider: React.FC<React.PropsWithChildren<{}>> = ({
           (device) => device.kind === "videoinput"
         );
         setSelectedVideoDevice(videoInput || null);
+
+        if (videoInput.label !== "None") {
+          console.log("Initializing camera window");
+          console.log("Selected video device:", videoInput);
+          import("@tauri-apps/api/window").then(({ WebviewWindow }) => {
+            if (WebviewWindow.getByLabel("camera") === null) {
+              initializeCameraWindow();
+            }
+          });
+        }
       }
       if (!selectedAudioDevice) {
         const audioInput = formattedDevices.find(
